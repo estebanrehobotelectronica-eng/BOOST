@@ -1,0 +1,693 @@
+/* ============================================================
+ * main.c - STM32G474 (BUCK-BOOST AUTOMÁTICO OPTIMIZADO)
+ * ============================================================ */
+
+#include "main.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+
+extern ADC_HandleTypeDef hadc1;
+extern UART_HandleTypeDef huart2;
+
+/* ============================================================
+ * CONFIGURACION Y SETPOINT
+ * ============================================================ */
+
+#define TARGET_VOUT_V_DEFAULT       6.0f
+
+/* SEGURIDAD */
+#define VOUT_MAX_SAFE_V             50.0f
+#define VIN_MIN_VALID_V              0.0f
+
+/* DUTY */
+#define DUTY_MIN_PERCENT             0.0f
+#define BUCK_DUTY_MAX_PERCENT       90.0f
+#define BOOST_DUTY_MAX_PERCENT      50.0f
+#define DUTY_START_PERCENT           0.1f
+
+/* CAMBIO BUCK / BOOST */
+#define MODE_TRANSITION_BAND_V      0.50f
+
+/* FRECUENCIA */
+#define TEST_FREQUENCY_HZ           70000UL
+#define SW_OVERHEAD_TICKS           660UL
+
+/* PID */
+#define CONTROL_PERIOD_MS            1UL
+#define KP_VOLTAGE                 0.40f
+#define KI_VOLTAGE                 25.5f
+#define KD_VOLTAGE               0.0001f
+
+#define INTEGRAL_MIN              -40.0f
+#define INTEGRAL_MAX               190.0f
+#define VOUT_CONTROL_DEADBAND_V     0.02f
+
+/* DEAD TIME */
+#define BUCK_DEAD_TIME_US            1UL
+#define BOOST_DEAD_TIME_US           2UL
+
+/* BOOTSTRAP */
+#define BOOT_REFRESH_CYCLES        100UL
+#define BOOT_REFRESH_ON_US           1UL
+#define BOOST_BOOT_REFRESH_ON_US     2UL
+
+/* ADC */
+#define ADC_REFERENCE_MV          3300UL
+#define ADC_FULL_SCALE            4095UL
+
+/* DIVISOR */
+#define DIVIDER_RATIO_NUMERATOR     1901UL
+#define DIVIDER_RATIO_DENOMINATOR   100UL
+
+/* CALIBRACION DE CORRIENTE */
+#define IIN_OFFSET_MV              800.0f
+#define IIN_SENSITIVITY_MV_PER_A   807.3f
+
+#define IOUT_OFFSET_MV               0.0f
+#define IOUT_SENSITIVITY_MV_PER_A  190.3f
+
+/* TELEMETRIA */
+#define ADC_REPORT_PERIOD_MS        30UL
+
+/* PINES DRIVER */
+#define Q1_PORT    GPIOB
+#define Q1_PIN     GPIO_PIN_15
+
+#define Q2_PORT    GPIOB
+#define Q2_PIN     GPIO_PIN_14
+
+#define Q3_PORT    GPIOC
+#define Q3_PIN     GPIO_PIN_6
+
+#define Q4_PORT    GPIOC
+#define Q4_PIN     GPIO_PIN_7
+
+/* MODOS */
+typedef enum
+{
+    MODE_OFF = 0,
+    MODE_BUCK,
+    MODE_BOOST
+} ConverterMode;
+
+/* MACROS FAST GPIO (Acceso directo a BSRR para ultra velocidad) */
+#define Q1_SET()   (Q1_PORT->BSRR = Q1_PIN)
+#define Q1_RESET() (Q1_PORT->BSRR = (uint32_t)Q1_PIN << 16U)
+
+#define Q2_SET()   (Q2_PORT->BSRR = Q2_PIN)
+#define Q2_RESET() (Q2_PORT->BSRR = (uint32_t)Q2_PIN << 16U)
+
+#define Q3_SET()   (Q3_PORT->BSRR = Q3_PIN)
+#define Q3_RESET() (Q3_PORT->BSRR = (uint32_t)Q3_PIN << 16U)
+
+#define Q4_SET()   (Q4_PORT->BSRR = Q4_PIN)
+#define Q4_RESET() (Q4_PORT->BSRR = (uint32_t)Q4_PIN << 16U)
+
+/* VARIABLES GLOBALES */
+static float target_vout_v    = TARGET_VOUT_V_DEFAULT;
+static float current_duty_pct = DUTY_START_PERCENT;
+
+static float vin_voltage  = 0.0f;
+static float vout_voltage = 0.0f;
+static float iin_current  = 0.0f;
+static float iout_current = 0.0f;
+
+static ConverterMode current_mode = MODE_OFF;
+
+/* UART */
+#define UART_RX_BUF_SIZE 32
+static uint8_t rx_byte = 0;
+static char uart_rx_buf[UART_RX_BUF_SIZE];
+static uint8_t uart_rx_idx = 0;
+static volatile uint8_t command_ready = 0;
+
+/* PID */
+static float voltage_integral = 0.0f;
+static float prev_error       = 0.0f;
+
+/* PROTOTIPOS */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_USART2_UART_Init(void);
+
+static inline void Delay_ticks(uint32_t ticks)
+{
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < ticks);
+}
+
+static inline void Delay_us(uint32_t us)
+{
+    Delay_ticks(us * (SystemCoreClock / 1000000UL));
+}
+
+static void ALL_OFF(void)
+{
+    Q1_RESET();
+    Q2_RESET();
+    Q3_RESET();
+    Q4_RESET();
+}
+
+/* ============================================================
+ * CONMUTACIÓN OPTIMIZADA CON MACROS BSRR
+ * ============================================================ */
+
+static void RunBoostCycle(uint32_t q3_ticks, uint32_t q4_ticks)
+{
+    Q2_RESET();
+    Q4_RESET();
+    Q1_SET();
+    Q3_SET();
+
+    Delay_ticks(q3_ticks);
+
+    Q3_RESET();
+    Delay_us(BOOST_DEAD_TIME_US);
+
+    Q4_SET();
+    Delay_ticks(q4_ticks);
+
+    Q4_RESET();
+    Delay_us(BOOST_DEAD_TIME_US);
+}
+
+static void RunBuckCycle(uint32_t q1_ticks, uint32_t q2_ticks)
+{
+    Q2_RESET();
+    Q3_RESET();
+    Q4_SET();
+    Q1_SET();
+
+    Delay_ticks(q1_ticks);
+
+    Q1_RESET();
+    Delay_us(BUCK_DEAD_TIME_US);
+
+    Q2_SET();
+    Delay_ticks(q2_ticks);
+
+    Q2_RESET();
+    Delay_us(BUCK_DEAD_TIME_US);
+}
+
+static void RefreshBootstrap_Output(void)
+{
+    Q4_RESET();
+    Delay_us(BUCK_DEAD_TIME_US);
+
+    Q3_SET();
+    Delay_us(BOOT_REFRESH_ON_US);
+
+    Q3_RESET();
+    Delay_us(BUCK_DEAD_TIME_US);
+
+    Q4_SET();
+}
+
+static void RefreshBootstrap_Input(void)
+{
+    Q4_RESET();
+    Q3_SET();
+    Q1_RESET();
+
+    Delay_us(BOOST_DEAD_TIME_US);
+
+    Q2_SET();
+    Delay_us(BOOST_BOOT_REFRESH_ON_US);
+
+    Q2_RESET();
+    Delay_us(BOOST_DEAD_TIME_US);
+
+    Q1_SET();
+    Q3_RESET();
+}
+
+/* ============================================================
+ * LECTURA DE ADC Y CONTROL PID
+ * ============================================================ */
+
+static uint32_t ADC_Read_Channel_RAW(uint32_t channel)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return 0xFFFFU;
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) return 0xFFFFU;
+    if (HAL_ADC_PollForConversion(&hadc1, 1U) != HAL_OK) {
+        HAL_ADC_Stop(&hadc1);
+        return 0xFFFFU;
+    }
+
+    uint32_t val = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return val;
+}
+
+static uint8_t Read_ADC_All_Channels(float *vin, float *vout, float *iin, float *iout)
+{
+    uint32_t raw_vin  = ADC_Read_Channel_RAW(ADC_CHANNEL_1);
+    uint32_t raw_iin  = ADC_Read_Channel_RAW(ADC_CHANNEL_2);
+    uint32_t raw_vout = ADC_Read_Channel_RAW(ADC_CHANNEL_3);
+    uint32_t raw_iout = ADC_Read_Channel_RAW(ADC_CHANNEL_4);
+
+    if (raw_vin == 0xFFFFU || raw_iin == 0xFFFFU || raw_vout == 0xFFFFU || raw_iout == 0xFFFFU)
+        return 0;
+
+    uint32_t vin_adc_mV  = (raw_vin  * ADC_REFERENCE_MV) / ADC_FULL_SCALE;
+    uint32_t iin_adc_mV  = (raw_iin  * ADC_REFERENCE_MV) / ADC_FULL_SCALE;
+    uint32_t vout_adc_mV = (raw_vout * ADC_REFERENCE_MV) / ADC_FULL_SCALE;
+    uint32_t iout_adc_mV = (raw_iout * ADC_REFERENCE_MV) / ADC_FULL_SCALE;
+
+    float vin_inst  = ((float)vin_adc_mV  * DIVIDER_RATIO_NUMERATOR / DIVIDER_RATIO_DENOMINATOR) / 1000.0f;
+    float vout_inst = ((float)vout_adc_mV * DIVIDER_RATIO_NUMERATOR / DIVIDER_RATIO_DENOMINATOR) / 1000.0f;
+
+    float iin_inst  = ((float)iin_adc_mV  - IIN_OFFSET_MV)  / IIN_SENSITIVITY_MV_PER_A;
+    float iout_inst = ((float)iout_adc_mV - IOUT_OFFSET_MV) / IOUT_SENSITIVITY_MV_PER_A;
+
+    if (iin_inst < 0.0f)  iin_inst = 0.0f;
+    if (iout_inst < 0.0f) iout_inst = 0.0f;
+
+    *vin  = (*vin == 0.0f)  ? vin_inst  : (*vin * 0.7f)  + (vin_inst * 0.3f);
+    *vout = (*vout == 0.0f) ? vout_inst : (*vout * 0.7f) + (vout_inst * 0.3f);
+    *iin  = (*iin == 0.0f)  ? iin_inst  : (*iin * 0.7f)  + (iin_inst * 0.3f);
+    *iout = (*iout == 0.0f) ? iout_inst : (*iout * 0.7f) + (iout_inst * 0.3f);
+
+    return 1;
+}
+
+static ConverterMode DetermineMode(float vin)
+{
+    if (vin < VIN_MIN_VALID_V) return MODE_OFF;
+
+    if (current_mode == MODE_BUCK) {
+        if (vin < (target_vout_v - MODE_TRANSITION_BAND_V)) return MODE_BOOST;
+        return MODE_BUCK;
+    }
+    if (current_mode == MODE_BOOST) {
+        if (vin > (target_vout_v + MODE_TRANSITION_BAND_V)) return MODE_BUCK;
+        return MODE_BOOST;
+    }
+
+    if (vin > target_vout_v) return MODE_BUCK;
+    if (vin < target_vout_v) return MODE_BOOST;
+
+    return MODE_OFF;
+}
+
+static void ResetVoltageController(void)
+{
+    voltage_integral = 0.0f;
+    prev_error = 0.0f;
+}
+
+static void ChangeMode(ConverterMode new_mode)
+{
+    if (new_mode == current_mode) return;
+
+    ALL_OFF();
+    Delay_us(5UL);
+    ResetVoltageController();
+
+    if (new_mode == MODE_BUCK) {
+        Q3_RESET();
+        Q4_SET();
+    } else if (new_mode == MODE_BOOST) {
+        Q2_RESET();
+        Q1_SET();
+    }
+
+    current_mode = new_mode;
+}
+
+static void UpdateControl(float vin, float vout)
+{
+    float duty_max = (current_mode == MODE_BUCK) ? BUCK_DUTY_MAX_PERCENT : BOOST_DUTY_MAX_PERCENT;
+
+    if (vout >= VOUT_MAX_SAFE_V || vin < VIN_MIN_VALID_V) {
+        ALL_OFF();
+        current_mode = MODE_OFF;
+        current_duty_pct = DUTY_MIN_PERCENT;
+        ResetVoltageController();
+        return;
+    }
+
+    float duty_ff = 0.0f;
+    if (current_mode == MODE_BUCK && vin > 0.1f) {
+        duty_ff = (target_vout_v / vin) * 100.0f;
+    } else if (current_mode == MODE_BOOST && target_vout_v > 0.1f) {
+        duty_ff = (1.0f - (vin / target_vout_v)) * 100.0f;
+    }
+
+    float error = target_vout_v - vout;
+    if (error > -VOUT_CONTROL_DEADBAND_V && error < VOUT_CONTROL_DEADBAND_V) {
+        error = 0.0f;
+    }
+
+    float dt = (float)CONTROL_PERIOD_MS / 1000.0f;
+    voltage_integral += KI_VOLTAGE * error * dt;
+
+    if (voltage_integral > INTEGRAL_MAX) voltage_integral = INTEGRAL_MAX;
+    if (voltage_integral < INTEGRAL_MIN) voltage_integral = INTEGRAL_MIN;
+
+    float derivative = (dt > 0.0f) ? ((error - prev_error) / dt) : 0.0f;
+    prev_error = error;
+
+    float target_duty = duty_ff + (KP_VOLTAGE * error) + voltage_integral + (KD_VOLTAGE * derivative);
+
+    if (target_duty > duty_max) target_duty = duty_max;
+    if (target_duty < DUTY_MIN_PERCENT) target_duty = DUTY_MIN_PERCENT;
+
+    current_duty_pct = target_duty;
+}
+
+/* ============================================================
+ * COMANDOS UART Y TELEMETRIA
+ * ============================================================ */
+
+static void Process_UART_Command(void)
+{
+    if (!command_ready) return;
+    command_ready = 0U;
+
+    if (strncmp(uart_rx_buf, "VSET ", 5) == 0 || strncmp(uart_rx_buf, "vset ", 5) == 0) {
+        char *endptr = NULL;
+        float new_target = strtof(&uart_rx_buf[5], &endptr);
+
+        if (endptr != NULL && *endptr == '\0' && new_target >= 0.5f && new_target <= 45.0f) {
+            if (new_target != target_vout_v) {
+                target_vout_v = new_target;
+                ResetVoltageController();
+            }
+            char msg[64];
+            int len = snprintf(msg, sizeof(msg), "[OK] VSET=%.2f V\r\n", target_vout_v);
+            if (len > 0) HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)len, 20U);
+        } else {
+            const char *err = "[ERROR] VSET valido: 0.5 a 45 V\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t *)err, (uint16_t)strlen(err), 20U);
+        }
+    }
+
+    memset(uart_rx_buf, 0, sizeof(uart_rx_buf));
+    uart_rx_idx = 0U;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART2) return;
+
+    if (command_ready) {
+        HAL_UART_Receive_IT(&huart2, &rx_byte, 1U);
+        return;
+    }
+
+    if (rx_byte == '\r' || rx_byte == '\n') {
+        if (uart_rx_idx > 0U) {
+            uart_rx_buf[uart_rx_idx] = '\0';
+            command_ready = 1U;
+            uart_rx_idx = 0U;
+        }
+    } else {
+        if (uart_rx_idx < (UART_RX_BUF_SIZE - 1U)) {
+            uart_rx_buf[uart_rx_idx++] = (char)rx_byte;
+        } else {
+            uart_rx_idx = 0U;
+            memset(uart_rx_buf, 0, sizeof(uart_rx_buf));
+        }
+    }
+
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1U);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        __HAL_UART_CLEAR_OREFLAG(&huart2);
+        __HAL_UART_CLEAR_NEFLAG(&huart2);
+        __HAL_UART_CLEAR_FEFLAG(&huart2);
+        HAL_UART_Receive_IT(&huart2, &rx_byte, 1U);
+    }
+}
+
+static void SendTelemetry(float vin, float vout, float iin, float iout, float duty)
+{
+    char buffer[96];
+    uint32_t vin_cv  = (uint32_t)(vin * 100.0f);
+    uint32_t vout_cv = (uint32_t)(vout * 100.0f);
+    uint32_t iin_ca  = (uint32_t)(iin * 100.0f);
+    uint32_t iout_ca = (uint32_t)(iout * 100.0f);
+    uint32_t duty_cv = (uint32_t)(duty * 10.0f);
+
+    int len = snprintf(buffer, sizeof(buffer),
+        "VIN:%lu.%02lu,VOUT:%lu.%02lu,IIN:%lu.%02lu,IOUT:%lu.%02lu,DUTY:%lu.%1lu\r\n",
+        (unsigned long)(vin_cv / 100UL),  (unsigned long)(vin_cv % 100UL),
+        (unsigned long)(vout_cv / 100UL), (unsigned long)(vout_cv % 100UL),
+        (unsigned long)(iin_ca / 100UL),  (unsigned long)(iin_ca % 100UL),
+        (unsigned long)(iout_ca / 100UL), (unsigned long)(iout_ca % 100UL),
+        (unsigned long)(duty_cv / 10UL),  (unsigned long)(duty_cv % 10UL));
+
+    if (len > 0) HAL_UART_Transmit(&huart2, (uint8_t *)buffer, (uint16_t)len, 5);
+}
+
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_USART2_UART_Init();
+    MX_ADC1_Init();
+
+    /* DWT (Data Watchpoint and Trace) */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    DWT->CYCCNT = 0;
+
+    if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK) {
+        Error_Handler();
+    }
+
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1U);
+
+    /* Ticks de conmutación a 170 MHz */
+    uint32_t nominal_ticks = SystemCoreClock / TEST_FREQUENCY_HZ;
+    const uint32_t period_ticks = (nominal_ticks > SW_OVERHEAD_TICKS) ?
+                                   (nominal_ticks - SW_OVERHEAD_TICKS) : 1000UL;
+
+    ALL_OFF();
+    HAL_Delay(500);
+
+    if (target_vout_v <= 0.0f || target_vout_v >= VOUT_MAX_SAFE_V) {
+        ALL_OFF();
+        while (1) { HAL_Delay(1000); }
+    }
+
+    if (!Read_ADC_All_Channels(&vin_voltage, &vout_voltage, &iin_current, &iout_current)) {
+        ALL_OFF();
+        current_mode = MODE_OFF;
+        while (1) { HAL_Delay(1000); }
+    }
+
+    current_mode = MODE_OFF;
+    ConverterMode initial_mode = DetermineMode(vin_voltage);
+    ChangeMode(initial_mode);
+
+    uint32_t cycle_counter = 0UL;
+    uint32_t control_timer = HAL_GetTick();
+    uint32_t telemetry_timer = HAL_GetTick();
+
+    /* ========================================================
+     * LOOP PRINCIPAL
+     * ======================================================== */
+
+    while (1)
+    {
+        Process_UART_Command();
+
+        if (current_mode == MODE_BUCK)
+        {
+            uint32_t dead_ticks = BUCK_DEAD_TIME_US * (SystemCoreClock / 1000000UL);
+            uint32_t q1_ticks   = (uint32_t)((period_ticks * current_duty_pct) / 100.0f);
+            uint32_t q2_ticks   = (period_ticks > q1_ticks + (2UL * dead_ticks)) ?
+                                  (period_ticks - q1_ticks - (2UL * dead_ticks)) : 0UL;
+
+            if (q1_ticks < 1UL && current_duty_pct > 0.0f) q1_ticks = 1UL;
+
+            RunBuckCycle(q1_ticks, q2_ticks);
+
+            if (++cycle_counter >= BOOT_REFRESH_CYCLES) {
+                cycle_counter = 0UL;
+                RefreshBootstrap_Output();
+            }
+        }
+        else if (current_mode == MODE_BOOST)
+        {
+            uint32_t dead_ticks = BOOST_DEAD_TIME_US * (SystemCoreClock / 1000000UL);
+            uint32_t q3_ticks   = (uint32_t)((period_ticks * current_duty_pct) / 100.0f);
+            uint32_t q4_ticks   = (period_ticks > q3_ticks + (2UL * dead_ticks)) ?
+                                  (period_ticks - q3_ticks - (2UL * dead_ticks)) : 0UL;
+
+            if (q3_ticks < 1UL && current_duty_pct > 0.0f) q3_ticks = 1UL;
+
+            RunBoostCycle(q3_ticks, q4_ticks);
+
+            if (++cycle_counter >= BOOT_REFRESH_CYCLES) {
+                cycle_counter = 0UL;
+                RefreshBootstrap_Output();
+                RefreshBootstrap_Input();
+            }
+        }
+
+        /* CONTROL PID CADA 1 ms */
+        if ((HAL_GetTick() - control_timer) >= CONTROL_PERIOD_MS) {
+            control_timer = HAL_GetTick();
+
+            if (Read_ADC_All_Channels(&vin_voltage, &vout_voltage, &iin_current, &iout_current)) {
+                if (vout_voltage >= VOUT_MAX_SAFE_V || vin_voltage < VIN_MIN_VALID_V) {
+                    ALL_OFF();
+                    current_mode = MODE_OFF;
+                    current_duty_pct = DUTY_MIN_PERCENT;
+                    ResetVoltageController();
+                    continue;
+                }
+
+                ConverterMode requested_mode = DetermineMode(vin_voltage);
+                if (requested_mode != current_mode) ChangeMode(requested_mode);
+                if (current_mode != MODE_OFF) UpdateControl(vin_voltage, vout_voltage);
+            }
+        }
+
+        /* TELEMETRIA */
+        if ((HAL_GetTick() - telemetry_timer) >= ADC_REPORT_PERIOD_MS) {
+            telemetry_timer = HAL_GetTick();
+            SendTelemetry(vin_voltage, vout_voltage, iin_current, iout_current, current_duty_pct);
+        }
+    }
+}
+
+/* ============================================================
+ * CONFIGURACION DE RELOJ HASTA 170 MHz (PLL ACTIVADO)
+ * ============================================================ */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    /* HSI = 16 MHz -> PLL = 170 MHz */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;    /* 16 MHz / 4 = 4 MHz */
+    RCC_OscInitStruct.PLL.PLLN = 85;               /* 4 MHz * 85 = 340 MHz */
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+    RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;    /* 340 MHz / 2 = 170 MHz (SYSCLK) */
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+static void MX_ADC1_Init(void)
+{
+    ADC_MultiModeTypeDef multimode = {0};
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.GainCompensation = 0;
+    hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc1.Init.LowPowerAutoWait = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+    hadc1.Init.OversamplingMode = DISABLE;
+
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+
+    multimode.Mode = ADC_MODE_INDEPENDENT;
+    if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK) Error_Handler();
+}
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = 115200;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+    huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+    huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6  | GPIO_PIN_7,  GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {}
+}
